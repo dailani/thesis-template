@@ -1,0 +1,133 @@
+\chapter{Aplying the Case Study and Conclusion}
+\label{ch:conclusion}
+This chapter shows how the proposed pipeline is applied to the industry-inspired scenario where a small team builds a warehouse and classifier for X/Twitter news. We follow the blueprint step by step and make concrete design choices that fit the team needs.
+We also draw the main conclusions of the thesis.
+
+
+\section{Case Study: News Classification on X/Twitter}
+
+\subsection{Extraction Strategy , Transformation Schema and Loading}
+
+We extract news from X/Twitter using the Recent Search endpoint, which returns public posts from the last week with a simple authenticated request, for example:
+% preamble: \usepackage{listings}
+\begin{lstlisting}[language=bash,caption={Recent search via X API},label={lst:x-recent-search}]
+curl --request GET \
+  --url https://api.x.com/2/tweets/search/recent \
+  --header 'Authorization: Bearer <token>'
+\end{lstlisting}
+
+Before writing any extractor, we define a logical data map that lists each field we will store, its meaning, and how it will be used downstream.
+
+% Requires in preamble:
+% \usepackage{tabularx}
+% \usepackage{booktabs}
+
+\begin{table}[htbp]
+    \centering
+    \begin{tabularx}{\linewidth}{@{}l l X X@{}}
+        \toprule
+        \textbf{Field}  & \textbf{Type}   & \textbf{Meaning}                                         & \textbf{How is used}                                                            \\
+        \midrule
+        id              & string          & Unique identifier of the post                            & Primary key, deduplication, stable join key across layers                       \\
+        created\_at     & timestamp (UTC) & Time the post was created                                & Event time for partitions and time series analysis, windowed metrics, backfills \\
+        author\_id      & string          & Stable identifier of the author                          & Join to user table, author level features, longitudinal analysis                \\
+        username        & string          & Public handle of the author                              & Display in UI, secondary dedup checks, moderation workflows                     \\
+        text            & string          & Full text of the post                                    & Main model input, search index content, text preprocessing and tokenization     \\
+        public\_metrics & integer         & Number of likes                                          & Feature engineering, sampling strategies, evaluation  by engagement             \\
+
+        retrieved\_at   & timestamp (UTC) & Ingestion time recorded by our pipeline                  & Lineage, Bronze partitioning, reproducible re-runs and auditing                 \\
+        source          & string (enum)   & Provenance label, for example \texttt{x\_recent\_search} & Data lineage and filtering when multiple sources are combined                   \\
+        \bottomrule
+    \end{tabularx}
+    \caption{Logical data map: fields, types, meaning, and downstream use.}
+    \label{tab:logical_data_map}
+\end{table}
+
+Afterwards  we conduct field profiling that validates what arrives matches our expectations and is worth keeping. Concretely, we check data types and formats for \texttt{id} and \texttt{created\_at}, completeness rates for \texttt{text}, uniqueness of \texttt{id}, and consistency of \texttt{author\_id} to catch orphaned records. On the content side, we measure basic text characteristics such as length, presence of URLs, mentions, and hashtags, and run a lightweight language detection to ensure we ingest the intended language. For \texttt{public\_metrics}, we verify nonnegative integers and flag extreme values for review. These profiling steps help us trim unused attributes, document assumptions, and detect source quirks early. The extractor returns only the mapped fields, along with minimal ingestion metadata like \texttt{retrieved\_at} and \texttt{source}, and prepares them to be written into staging area. This keeps the footprint on the source small, reduces downstream cleaning, and gives us a well described, analysis ready subset of the stream.
+
+\FloatBarrier
+
+\subsection{Medallion layout}
+
+\paragraph{Bronze}
+Bronze stores the raw API payloads exactly as received from the Recent Search endpoint, together with minimal ingestion metadata such as \texttt{run\_id}, \texttt{ingest\_batch\_id}, \texttt{source}, \texttt{retrieved\_at}, \texttt{connector}, \texttt{version}, and \texttt{http\_status}. Data is written append-only and partitioned by \texttt{retrieved\_date} and \texttt{source}. The table \texttt{bronze.tweets\_raw} keeps the native \texttt{id} field but applies no transformations. This layer is the legal record of what arrived and when, which preserves originals for audit and allows any past day to be reprocessed.
+\paragraph{Silver}
+Silver standardizes structure and quality for analysis and modeling. Only rows that pass basic checks are promoted from Bronze: valid JSON, required fields present (\texttt{id}, \texttt{created\_at}, \texttt{author\_id}, \texttt{text}), parseable timestamps, nonnegative metrics, and no duplicates by \texttt{id} within the partition. At this stage we cast types, deduplicate by \texttt{id}, drop rows with null \texttt{text} or invalid timestamps, and apply light normalization while keeping an untouched copy of the text as \texttt{text\_raw}. We also derive simple flags such as \texttt{lang}, \texttt{has\_url}, \texttt{has\_hashtag}, \texttt{has\_mention}, and \texttt{text\_len}, and ensure \texttt{created\_at} is not after \texttt{retrieved\_at}. The main table, \texttt{silver.tweets\_clean}, includes \texttt{document\_id} (alias of \texttt{id}), \texttt{created\_at}, \texttt{author\_id}, \texttt{username}, \texttt{text\_raw}, \texttt{text\_clean}, \texttt{public\_metrics}, the derived flags, \texttt{retrieved\_at}, \texttt{source}, and a \texttt{bronze\_run\_id} pointer. Partitioning can use \texttt{created\_date} for analysis or \texttt{retrieved\_date} for operational symmetry.
+\paragraph{Gold}
+Gold provides curated views for business use and records ML outputs without changing upstream data. A curated table, \texttt{gold.news\_curated}, associates selected columns from \texttt{silver.tweets\_clean} and applies any documented business filters, for example language or moderation rules. Predictions are stored in \texttt{gold.predictions}, with one row per inference and columns for \texttt{document\_id}, silver snapshot or hash, scoring \texttt{run\_id}, \texttt{predicted\_label}, optional scores, \texttt{predicted\_at}, and full model lineage such as \texttt{model\_version}, \texttt{model\_type}, \texttt{used\_hyperparameters}, \texttt{training\_run\_id}, and the training data window. Typical usage joins \texttt{gold.news\_curated} with the latest prediction per \texttt{document\_id} to serve labeled content, or starts from \texttt{gold.predictions} and joins back to \texttt{silver.tweets\_clean} (and if needed to Bronze via \texttt{bronze\_run\_id}) to audit any individual result. This separation keeps history across model versions, supports reproducible comparisons, and ensures upstream layers remain immutable.
+
+\subsection{Loading Strategy}
+We start with a historical backfill to populate Bronze and Silver,and split into manageable chunks. After that, we switch to daily incremental loads. Append only is used for immutable facts in bronze, while upsert is used where corrections are expected like silver. Each run targets a known partition and is repeatable. Bulk loading by partition gives predictable performance.
+
+
+\subsubsection{Model Choice , training and evaluation}
+For the first single label version we use a Linear SVM with TF-IDF features. We fit a TF-IDF vectorizer on the training split, persist its vocabulary, and transform validation and test with the same mapping. We tune the regularization parameter C and the maximum number of features for TF-IDF with a small grid search and stratified k-fold cross validation  We also set class weights to balanced when the label distribution is skewed. All artifacts that affect inference are versioned, the label encoder, the fitted TF-IDF vectorizer, and the SVM weights.
+
+\smallbreak
+Evaluation follows a simple, repeatable protocol.We use a consistent data splitting approach that preserves label balance and supports fair, repeatable evaluation. On the test set we compute accuracy,  precision,  recall, and  F1, and we include per class evaluation to study minority class behavior.
+Every training run writes a compact run record with \texttt{run\_id}, \texttt{model\_version}, \texttt{model\_type}, \texttt{hyperparameters}, \texttt{tfidf\_config}, \texttt{feature\_spec\_version}, \texttt{random\_seed}, and the exact \texttt{silver\_snapshot\_id} or \texttt{silver\_snapshot\_hash} used for training.
+\smallbreak
+
+
+
+After trainging, we log results into Gold. The table \texttt{gold.predictions} stores one row per inference with \texttt{document\_id}, \texttt{predicted\_label}, optional \texttt{score} or \texttt{probability}, \texttt{predicted\_at}, \texttt{model\_version}, \texttt{training\_run\_id}, and a pointer to the Silver snapshot. This table never mutates Silver and allows us to retrieve the exact input later. Aggregate metrics go to \texttt{gold.eval\_daily} and \texttt{gold.eval\_by\_class}. The daily table holds \texttt{date}, \texttt{metric\_name}, \texttt{metric\_value}, \texttt{model\_version}, \texttt{run\_id}, and the data window used. The by class table adds \texttt{class\_name} and supports dashboards that track macro and per class trends over time. With these two Gold outputs we can serve labeled news to users and audit model quality by date, class, and \texttt{model\_version} without changing the upstream layers. When we later upgrade to multi label, the same contracts hold: predictions become arrays or a sparse label set, scores become per label vectors, and the evaluation tables add micro and macro averages for multi label without any change to the ETL or layer boundaries.
+
+\subsubsection{Monitoring \&Retraining Strategy}
+
+News streams shift quickly. Topics, entities, and wording change week to week, but yesterday’s knowledge still matters. A naive retrain on only the newest data adapts fast but forgets earlier patterns, which shows up as swings in per class performance. Replay based learning mixes a slice of past labeled examples with the latest labels, so the model rehearses what it already knows while learning new topics. This is a good match for short texts with fast vocabulary churn, limited labeling capacity, and a small team, because it is simple to operate, stable across updates, and compute friendly
+\smallbreak
+
+First We track two kinds of drift. First, input drift from the data we fetch,where for each key feature we keep rolling summaries over a recent time window and compare them to a fixed reference window. For text, this includes token frequencies, average text length, share of posts with links, mentions, or hashtags, and language share. For numeric fields like engagement counts we check basic moments and rate distributions. We set clear thresholds, and alert when a feature moves beyond its constrain. Second, performance drift from the model,where on the next incoming batch with labels available, we run a prequential check that scores the batch before training and records accuracy,  precision,  recall,  F1, and per class metrics. Both input and performance monitors write dated records to Gold so we can review trends by date, segment, and model version.
+
+\smallbreak
+
+We implement replay in a simple, repeatable way. First, we maintain a class balanced pool of past labeled news together with their labels and basic lineage, stored as a small table (for example \texttt{gold.retraining\_pool}) with fields like \texttt{document\_id}, \texttt{label}, \texttt{inserted\_at}, and a \texttt{selection\_score}. After each cycle, we refresh this pool by adding a small, representative sample from the newest labeled data and removing redundant or least informative items, so the pool stays within a fixed size and rare classes remain present. When retraining is triggered, we build the training set by mixing recent labeled data with a replay slice from the pool, and we pin all inputs to a stable snapshot so they are reproducible. We then train under the existing input and output contracts, tweak key hyperparameters and validate  from the same window. Next, we log run metadata, metrics, and candidate predictions to dedicated evaluation and prediction tables, and we compare the candidate against the active model on the same time ranges. If the candidate meets acceptance thresholds overall and on critical classes, we promote it by updating the production model in the model registry. This keeps the process clear, auditable, and low effort for a small team.
+
+
+
+\section{Requirement Mapping}
+This section explains how our implemented pipeline satisfies each requirement by mapping it to specific design choices and pointing to concrete artifacts in the thesis.
+% Requires in preamble:
+% \usepackage{tabularx,booktabs}
+% \newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\begin{table}[tbp]
+    \centering
+    \footnotesize
+    \begin{tabularx}{\linewidth}{@{}l l Y Y Y@{}}
+        \toprule
+        \textbf{ID} & \textbf{Type}     & \textbf{Requirement}                                                                     & \textbf{Design choice}                                  & \textbf{How applied in case study}                                                                                                  \\
+        \midrule
+        R1          & Pipeline Must     & Fetch and normalize data into a common staging area                                      & Logical data map and low impact extraction into staging & Use Recent Search API, select mapped fields only, add retrieved\_at and source, land to Bronze staging                              \\
+        R2          & Governance Must   & Raw data immutable; transforms and predictions stored separately; never overwrite source & Medallion layout and append only Bronze                 & Bronze keeps raw payloads immutable; Silver holds cleaned data; predictions recorded in Gold without altering upstream              \\
+        R3          & ML Must           & Single label classification from known categories                                        & Linear SVM over TF IDF with label encoder               & Train single label classifier now; keep interfaces so multi label can be added later without changing ETL                           \\
+        R4          & Governance Must   & Runs and predictions auditable to run, model version, and hyperparameters                & Full lineage logging and model registry                 & Log run\_id, model\_version, model\_type, used\_hyperparameters, silver\_snapshot\_id; store predictions with predicted\_at in Gold \\
+        R5          & Data Quality Must & Schema and type validation before training or serving                                    & Promotion gates at Silver                               & Enforce required fields, types, dedup by id, basic text normalization; only passing rows promoted to Silver for ML                  \\
+        R6          & ML/CL Should      & Adapt to new data flow as it evolves                                                     & Drift monitoring plus replay based retraining           & Track input and performance drift; on threshold, retrain with mixed new and replay items; log eval in Gold and promote via registry \\
+        R7          & Arch/Cost Should  & Prefer simple libraries over heavy third party platforms                                 & Minimal stack with clear contracts                      & Python jobs, TF IDF, Linear SVM, small model registry, RPC predict endpoint; decoupled layers via stable schemas                    \\
+        \bottomrule
+    \end{tabularx}
+    \caption{Requirement rewrite and mapping to design choices and their application.}
+    \label{tab:req_mapping_rewrite}
+\end{table}
+\FloatBarrier
+\section{Conclusion}
+This thesis designed and validated a modular classification pipeline with embedded continuous learning for small teams with limited resources. By decoupling our pipeline into multiple components that interact with each other like: ingestion, transformation, loading, modeling, evaluation, serving, and monitoring through clear interfaces and data contracts, the blueprint reduces complexity, supports safe change, and preserves lineage across the full lifecycle. The news case study showed how the architecture turns into concrete choices. Every run is auditable and Raw data stays immutable.
+
+The blueprint helps companies move faster from raw data to decisions while keeping risk in check. The staged layout (Bronze, Silver, Gold) makes quality and governance tangible, where raw inputs stay immutable, cleaned datasets are standardized for analytics, and predictions plus metrics are recorded without mutating upstream layers. This separation of concerns improves reliability and enables reproducible rollbacks, which is especially important when requirements evolve. The outputs in Gold are immediately consumable by dashboards and services, while model lineage and run metadata support audits and stakeholder trust.
+\smallbreak
+
+The design follows up to date data platform practice. It uses layered datasets, quality gates, experiment tracking, and a clean model training . What makes this design powerful are these three built in traits:
+
+\begin{itemize}
+    \item \textbf{Traceability:} every result is explainable over time, every experiment tracked and each data stage versioned.
+    \item \textbf{Adaptability:} monitored drift triggers a repeatable retraining loop that keeps the models adaptable to new data distributions..
+    \item \textbf{Composability:} pipeline is build on different modules that can be upgrade independently, so new extractors, models, or retraining strategies can be plugged in without changing the whole system.
+\end{itemize}
+
+\subsection{Limitations}
+There are some limitations to this work. First, this thesis is a design blueprint. It offers a high-level architecture, not a full product. Each module can be implemented, but doing so needs more example work, patterns, and tests. Teams will need to study concrete cases for their domain before coding. The case study is a simplified scenario that does not cover all real world complexities. For example, it assumes clean labels are available for retraining, which may not hold in practice. On a technical level , the pipeline does not address streaming instead it focuses on backills and daily batches. Also there is no deplyoyment automation or infra as code, which are important for production. Finally, the blueprint does not cover advanced topics like data privacy, security, or compliance, which are critical in many industries.
+
+\subsection{Future Work}
+Future work can extend this blueprint in several ways. We can turn the blueprint into a reference implementation with code examples, tests, and deployment guides,which  would help teams get started faster. WE can upgrade some core components , like introducing streaming ingestion and real time scoring, which would make the pipeline more responsive. We can also explore more mmonitoring and retraining strategies, like active learning or semi supervised learning. A good CI/CD pipeline would help automate testing, deployment, of the models, and makle it easier to manage versions or automatic retraining. Finally, we can study how to apply this design in regulated industries, where data privacy, security, and compliance are critical, and adapt the blueprint to meet those needs.
+
