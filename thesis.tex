@@ -60,21 +60,32 @@
 \begin{document}
 \frenchspacing
 \raggedbottom
-\selectlanguage{ngerman} % ngerman, american
+\AtBeginDocument{\selectlanguage{american}}
+% ngerman, american
 %\renewcommand*{\bibname}{new name}
 %\setbibpreamble{}
+
+\clearpage
+\thispagestyle{empty}
+\null
+\newpage
+
 \pagenumbering{roman}
 \pagestyle{plain}
 %*************************************************************************
 % Frontmatter
 %*************************************************************************
+
 \include{frontbackmatter/Titlepage}
 \include{frontbackmatter/Titleback}
 %\cleardoublepage\include{frontbackmatter/Dedication}
 %\cleardoublepage\include{frontbackmatter/Foreword}
 \cleardoublepage\include{frontbackmatter/Declaration}
 \condLOCK{\cleardoublepage\include{frontbackmatter/BlockingNotice}}
+\cleardoublepage\include{frontbackmatter/AbstractDE}
+
 \cleardoublepage\include{frontbackmatter/AbstractEN}
+
 %\cleardoublepage\include{frontbackmatter/Publications}
 %\cleardoublepage\include{frontbackmatter/Acknowledgments}
 \cleardoublepage\include{frontbackmatter/Contents}
